@@ -178,6 +178,12 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
     state = _load_state(dataset_dir)
     current_idx = {"value": 0}
 
+    # --- pre-compute metadata for all files ---
+    all_meta: list[dict] = [_load_meta(f) for f in files]
+
+    # Filtered indices — indices into `files` that pass the current filter
+    filtered_indices: list[int] = list(range(len(files)))
+
     # --- refs to updatable widgets ---
     refs: dict = {}
 
@@ -207,7 +213,7 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
         glb_url = _get_glb_url(path)
         scene.gltf(glb_url)
 
-        meta = _load_meta(path)
+        meta = all_meta[idx]
         _draw_bbox(scene, meta["bounds_min"], meta["bounds_max"])
 
         # info panel
@@ -229,9 +235,19 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
     def _update_footer() -> None:
         acc, den, rem = _counts()
         total_reviewed = acc + den
-        refs["footer_label"].set_text(
-            f"Reviewed {total_reviewed}/{len(files)}  |  Accepted: {acc}  Denied: {den}  Remaining: {rem}"
-        )
+        showing = len(filtered_indices)
+        if showing < len(files):
+            footer_text = (
+                f"Showing {showing}/{len(files)}  |  "
+                f"Reviewed {total_reviewed}/{len(files)}  |  "
+                f"Accepted: {acc}  Denied: {den}  Remaining: {rem}"
+            )
+        else:
+            footer_text = (
+                f"Reviewed {total_reviewed}/{len(files)}  |  "
+                f"Accepted: {acc}  Denied: {den}  Remaining: {rem}"
+            )
+        refs["footer_label"].set_text(footer_text)
         refs["progress"].set_value(total_reviewed / len(files) if files else 0)
         refs["stat_acc"].set_text(f"Accepted: {acc}")
         refs["stat_den"].set_text(f"Denied: {den}")
@@ -242,21 +258,22 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
         for i, row in enumerate(refs["list_rows"]):
             stem = _stem(files[i])
             st = state.get(stem)
+            hidden = " hidden" if i not in filtered_indices else ""
             if i == idx:
                 row.classes(
-                    replace="w-full cursor-pointer px-2 py-1 rounded bg-[#0277BD]/40"
+                    replace=f"w-full cursor-pointer px-2 py-1 rounded bg-[#0277BD]/40{hidden}"
                 )
             elif st == STATUS_ACCEPT:
                 row.classes(
-                    replace="w-full cursor-pointer px-2 py-1 rounded bg-[#4ade80]/10"
+                    replace=f"w-full cursor-pointer px-2 py-1 rounded bg-[#4ade80]/10{hidden}"
                 )
             elif st == STATUS_DENY:
                 row.classes(
-                    replace="w-full cursor-pointer px-2 py-1 rounded bg-[#f87171]/10"
+                    replace=f"w-full cursor-pointer px-2 py-1 rounded bg-[#f87171]/10{hidden}"
                 )
             else:
                 row.classes(
-                    replace="w-full cursor-pointer px-2 py-1 rounded hover:bg-white/5"
+                    replace=f"w-full cursor-pointer px-2 py-1 rounded hover:bg-white/5{hidden}"
                 )
 
     def _update_status_icons() -> None:
@@ -271,6 +288,61 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
                 icon_el.set_visibility(False)
 
     # ------------------------------------------------------------------
+    # Bounding-box filter
+    # ------------------------------------------------------------------
+
+    def _apply_filter() -> None:
+        filtered_indices.clear()
+        x_min = refs["filter_x_min"].value
+        x_max = refs["filter_x_max"].value
+        y_min = refs["filter_y_min"].value
+        y_max = refs["filter_y_max"].value
+        z_min = refs["filter_z_min"].value
+        z_max = refs["filter_z_max"].value
+
+        for i, meta in enumerate(all_meta):
+            dims_cm = meta["dims"] * 100
+            if (
+                (x_min is None or dims_cm[0] >= x_min)
+                and (x_max is None or dims_cm[0] <= x_max)
+                and (y_min is None or dims_cm[1] >= y_min)
+                and (y_max is None or dims_cm[1] <= y_max)
+                and (z_min is None or dims_cm[2] >= z_min)
+                and (z_max is None or dims_cm[2] <= z_max)
+            ):
+                filtered_indices.append(i)
+
+        # Update matched count
+        refs["filter_count"].set_text(
+            f"Matched: {len(filtered_indices)}/{len(files)}"
+        )
+        refs["objects_header"].set_text(
+            f"Objects ({len(filtered_indices)})"
+        )
+
+        # Show/hide list rows
+        for i, row in enumerate(refs["list_rows"]):
+            if i in filtered_indices:
+                row.classes(remove="hidden")
+            else:
+                row.classes(add="hidden")
+
+        # If current selection is hidden, auto-select first visible
+        if current_idx["value"] not in filtered_indices and filtered_indices:
+            select(filtered_indices[0])
+        else:
+            _update_footer()
+
+    def _reset_filter() -> None:
+        refs["filter_x_min"].set_value(None)
+        refs["filter_x_max"].set_value(None)
+        refs["filter_y_min"].set_value(None)
+        refs["filter_y_max"].set_value(None)
+        refs["filter_z_min"].set_value(None)
+        refs["filter_z_max"].set_value(None)
+        _apply_filter()
+
+    # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
 
@@ -280,9 +352,14 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
         state[stem] = status
         _save_state(dataset_dir, state)
         _update_status_icons()
-        # auto-advance
-        if idx < len(files) - 1:
-            select(idx + 1)
+        # auto-advance to next visible item
+        if idx in filtered_indices:
+            pos = filtered_indices.index(idx)
+            if pos + 1 < len(filtered_indices):
+                select(filtered_indices[pos + 1])
+            else:
+                _update_list_highlight()
+                _update_footer()
         else:
             _update_list_highlight()
             _update_footer()
@@ -294,10 +371,32 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
         _set_status(STATUS_DENY)
 
     def _prev() -> None:
-        select(current_idx["value"] - 1)
+        idx = current_idx["value"]
+        if idx in filtered_indices:
+            pos = filtered_indices.index(idx)
+            if pos > 0:
+                select(filtered_indices[pos - 1])
+        elif filtered_indices:
+            # Current item not visible; jump to nearest visible before it
+            for fi in reversed(filtered_indices):
+                if fi < idx:
+                    select(fi)
+                    return
+            select(filtered_indices[0])
 
     def _next() -> None:
-        select(current_idx["value"] + 1)
+        idx = current_idx["value"]
+        if idx in filtered_indices:
+            pos = filtered_indices.index(idx)
+            if pos + 1 < len(filtered_indices):
+                select(filtered_indices[pos + 1])
+        elif filtered_indices:
+            # Current item not visible; jump to nearest visible after it
+            for fi in filtered_indices:
+                if fi > idx:
+                    select(fi)
+                    return
+            select(filtered_indices[-1])
 
     async def _export() -> None:
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -393,8 +492,53 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
 
                 ui.separator()
 
+                # Bounding-box filter
+                ui.label("Filter (bbox cm)").classes(SECTION_HEADER)
+                axis_labels = ["X", "Y", "Z"]
+                axis_keys = ["x", "y", "z"]
+                for ax_i, (label, key) in enumerate(zip(axis_labels, axis_keys)):
+                    with ui.row(wrap=False).classes(
+                        "w-full items-center gap-1"
+                    ):
+                        ui.label(label).classes(
+                            "text-xs text-gray-400 w-3 flex-shrink-0"
+                        )
+                        refs[f"filter_{key}_min"] = (
+                            ui.number(
+                                label="Min",
+                                value=None,
+                                format="%.1f",
+                                on_change=lambda _: _apply_filter(),
+                            )
+                            .props("dense outlined dark")
+                            .classes("flex-grow")
+                            .style("min-width: 0")
+                        )
+                        refs[f"filter_{key}_max"] = (
+                            ui.number(
+                                label="Max",
+                                value=None,
+                                format="%.1f",
+                                on_change=lambda _: _apply_filter(),
+                            )
+                            .props("dense outlined dark")
+                            .classes("flex-grow")
+                            .style("min-width: 0")
+                        )
+                with ui.row(wrap=False).classes("w-full items-center justify-between"):
+                    refs["filter_count"] = ui.label(
+                        f"Matched: {len(files)}/{len(files)}"
+                    ).classes("text-xs text-gray-400")
+                    ui.button(
+                        "Reset", icon="restart_alt", on_click=_reset_filter
+                    ).props("flat dense size=sm").classes("text-gray-400")
+
+                ui.separator()
+
                 # Object list
-                ui.label("Objects").classes(SECTION_HEADER)
+                refs["objects_header"] = ui.label(
+                    f"Objects ({len(files)})"
+                ).classes(SECTION_HEADER)
                 refs["list_rows"] = []
                 refs["list_icons"] = []
                 with ui.scroll_area().classes("w-full flex-grow"):
