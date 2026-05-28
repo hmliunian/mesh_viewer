@@ -1,0 +1,13 @@
+[project]
+name = "mesh-viewer"
+version = "0.1.0"
+description = "Review .geom.npz meshes and export accepted ones via a NiceGUI web UI."
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "trimesh",
+    "nicegui",
+]
+
+[tool.uv]
+package = false
