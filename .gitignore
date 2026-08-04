@@ -1,0 +1,53 @@
+# Local datasets and generated review data
+/input/*
+!/input/.gitkeep
+/reviewed_export/
+.mesh_reviewer/
+/.nicegui/
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+# Virtual environments and local dependency caches
+/.venv/
+/venv/
+/env/
+/ENV/
+.uv-cache/
+__pypackages__/
+
+# Python build and packaging artifacts
+/build/
+/dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.log
+
+# Editor and operating-system files
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -8,6 +8,8 @@ A web-based GUI for reviewing `.geom.npz` mesh files. Built with [NiceGUI](https
 - Accept / Deny workflow with review state persistence
 - Keyboard shortcuts: `A` accept, `D` deny, arrow keys to navigate
 - Export accepted meshes with metadata manifest
+- Fixed reviewer accounts with stable, even task assignment
+- Admin dashboard with live per-reviewer progress
 
 ## Prerequisites
 
@@ -30,13 +32,13 @@ uv sync
 ## Usage
 
 ```bash
-just run --dataset-dir /path/to/geom_npz_files --export-dir /tmp/reviewed_export
+just run --dataset-dir ./input --export-dir /tmp/reviewed_export
 ```
 
 Or directly:
 
 ```bash
-uv run python mesh_reviewer.py --dataset-dir /path/to/geom_npz_files
+uv run python mesh_reviewer.py --dataset-dir ./input
 ```
 
 ### CLI Options
@@ -47,7 +49,64 @@ uv run python mesh_reviewer.py --dataset-dir /path/to/geom_npz_files
 | `--export-dir`   | `./reviewed_export`  | Directory to export accepted meshes      |
 | `--port`         | `8090`               | Port for the web server                  |
 
+The dataset directory is scanned for `.geom.npz` files only.
+
+## Convert meshes to `.geom.npz`
+
+Convert every supported mesh in a directory (`.glb`, `.gltf`, `.obj`, `.off`,
+`.ply`, or `.stl`):
+
+```bash
+uv run python mesh_to_geom.py ./input
+```
+
+The command also accepts a single mesh file. Existing outputs are skipped; pass
+`--overwrite` to replace them. The viewer interprets coordinates as metres, so
+use `--scale 0.001` when source coordinates are in millimetres.
+
+Each output is named `<mesh-name>.geom.npz` and contains:
+
+| Key              | Shape    | Description                                |
+|------------------|----------|--------------------------------------------|
+| `vertices`       | `(N, 3)` | Vertex positions (`float32`)               |
+| `faces`          | `(M, 3)` | Triangle vertex indices (`int32`)          |
+| `vertex_normals` | `(N, 3)` | Per-vertex normals (`float32`)             |
+| `bounds_min`     | `(3,)`   | Axis-aligned bounding-box minimum          |
+| `bounds_max`     | `(3,)`   | Axis-aligned bounding-box maximum          |
+| `volume`         | scalar   | Enclosed volume, or `NaN` if not reliable |
+
+## Accounts
+
+The application has one admin and 20 fixed reviewers:
+
+- `admin`
+- `user01` through `user20`
+
+By default, each password is the same as its username. Configure passwords before
+exposing the server outside a trusted network:
+
+```bash
+export MESH_REVIEWER_ADMIN_PASSWORD='replace-admin-password'
+export MESH_REVIEWER_USER_PASSWORD='shared-reviewer-password'
+```
+
+An individual reviewer password can override the shared password:
+
+```bash
+export MESH_REVIEWER_USER01_PASSWORD='user01-password'
+```
+
+Assignments are created on first startup and stored under
+`<dataset-dir>/.mesh_reviewer/assignments.json`. Existing assignments stay stable;
+new files are assigned to the reviewer with the fewest active files. Review state
+is stored separately for each user in `<dataset-dir>/.mesh_reviewer/reviews/`.
+
+After login, reviewers see only their assigned files while retaining the existing
+Accept, Deny, filtering, navigation, and export workflow. The admin account is
+redirected to `/admin`, which displays aggregate and per-reviewer progress and can
+export all accepted meshes.
 ## Keyboard Shortcuts
+
 
 | Key   | Action          |
 |-------|-----------------|

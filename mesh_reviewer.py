@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import trimesh
+from fastapi.responses import RedirectResponse
 from nicegui import app, ui
 
 from consts import (
@@ -30,6 +31,19 @@ from consts import (
     SECTION_HEADER,
     inject_styles,
 )
+from multi_user import (
+    ADMIN_USERNAME,
+    USER_IDS,
+    authenticate,
+    build_credentials,
+    ensure_assignments,
+    ensure_state_dir,
+    files_for_user,
+    get_storage_secret,
+    load_review_state,
+    progress_rows,
+    set_review_status,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -37,7 +51,6 @@ from consts import (
 
 STATUS_ACCEPT = "accepted"
 STATUS_DENY = "denied"
-STATE_FILE = "_review_state.json"
 
 COLOR_ACCEPT = "#4ade80"
 COLOR_DENY = "#f87171"
@@ -48,23 +61,6 @@ STATUS_ICONS = {
     STATUS_ACCEPT: ("check_circle", COLOR_ACCEPT),
     STATUS_DENY: ("cancel", COLOR_DENY),
 }
-
-
-# ---------------------------------------------------------------------------
-# State management
-# ---------------------------------------------------------------------------
-
-
-def _load_state(dataset_dir: Path) -> dict[str, str]:
-    state_path = dataset_dir / STATE_FILE
-    if state_path.is_file():
-        return json.loads(state_path.read_text())
-    return {}
-
-
-def _save_state(dataset_dir: Path, state: dict[str, str]) -> None:
-    state_path = dataset_dir / STATE_FILE
-    state_path.write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -164,18 +160,38 @@ def _draw_bbox(scene_obj: ui.scene, bmin: np.ndarray, bmax: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_page(dataset_dir: Path, export_dir: Path) -> None:
+def _logout() -> None:
+    app.storage.user.clear()
+    ui.navigate.to("/login")
+
+
+def build_page(
+    dataset_dir: Path,
+    export_dir: Path,
+    state_dir: Path,
+    username: str,
+    files: list[Path],
+) -> None:
     inject_styles(ui)
 
-    # --- data ---
-    files = sorted(dataset_dir.glob("*.geom.npz"))
     if not files:
-        ui.label("No .geom.npz files found in dataset directory.").classes(
-            "text-xl text-red-400 m-8"
-        )
+        with ui.header(fixed=False).classes(HEADER):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("view_in_ar").classes("text-white text-2xl")
+                ui.label("Mesh Reviewer").classes("text-h6 font-bold text-white")
+            with ui.row().classes("items-center gap-2"):
+                ui.label(username).classes("text-sm text-gray-300")
+                ui.button(icon="logout", on_click=_logout).props("flat round").tooltip(
+                    "Log out"
+                )
+        with ui.column().classes(
+            "w-full min-h-[calc(100vh-64px)] items-center justify-center gap-2"
+        ):
+            ui.icon("inbox", size="xl").classes("text-gray-500")
+            ui.label("No meshes assigned").classes("text-lg text-gray-300")
         return
 
-    state = _load_state(dataset_dir)
+    state = load_review_state(state_dir, username)
     current_idx = {"value": 0}
 
     # --- pre-compute metadata for all files ---
@@ -188,8 +204,9 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
     refs: dict = {}
 
     def _counts() -> tuple[int, int, int]:
-        acc = sum(1 for v in state.values() if v == STATUS_ACCEPT)
-        den = sum(1 for v in state.values() if v == STATUS_DENY)
+        statuses = [state.get(_stem(path)) for path in files]
+        acc = sum(value == STATUS_ACCEPT for value in statuses)
+        den = sum(value == STATUS_DENY for value in statuses)
         return acc, den, len(files) - acc - den
 
     def _stem(p: Path) -> str:
@@ -349,8 +366,9 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
     def _set_status(status: str) -> None:
         idx = current_idx["value"]
         stem = _stem(files[idx])
-        state[stem] = status
-        _save_state(dataset_dir, state)
+        latest_state = set_review_status(state_dir, username, stem, status)
+        state.clear()
+        state.update(latest_state)
         _update_status_icons()
         # auto-advance to next visible item
         if idx in filtered_indices:
@@ -414,6 +432,7 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
                 {
                     "file": f.name,
                     "bbox_cm": [round(d * 100, 3) for d in dims],
+                    "reviewed_by": username,
                     "n_verts": meta["n_verts"],
                     "n_faces": meta["n_faces"],
                     "volume_cm3": round(float(meta["volume"]) * 1e6, 4)
@@ -422,7 +441,9 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
                 }
             )
 
-        (export_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        (export_dir / f"manifest_{username}.json").write_text(
+            json.dumps(manifest, indent=2)
+        )
         ui.notify(
             f"Exported {len(accepted)} meshes to {export_dir}",
             type="positive",
@@ -460,9 +481,16 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
             ui.label("Mesh Reviewer").classes(
                 "text-h6 font-bold text-white tracking-wide"
             )
+            ui.label(username).classes(
+                "text-xs font-medium text-gray-300 border border-gray-600 "
+                "px-2 py-1 rounded"
+            )
         with ui.row().classes("items-center gap-2"):
             ui.button("Export Accepted", icon="file_download", on_click=_export).props(
                 "flat text-color=white"
+            )
+            ui.button(icon="logout", on_click=_logout).props("flat round").tooltip(
+                "Log out"
             )
 
     # Main content
@@ -570,6 +598,9 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
                 ui.label(f"Export: {export_dir}").classes(
                     "text-xs text-gray-500 break-all"
                 )
+                ui.label(f"Reviewer: {username}").classes(
+                    "text-xs text-gray-500 break-all"
+                )
 
         # ----- right content -----
         with splitter.after:
@@ -633,7 +664,190 @@ def build_page(dataset_dir: Path, export_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Authentication and admin pages
+# ---------------------------------------------------------------------------
+
+def build_login_page(credentials: dict[str, str]) -> None:
+    inject_styles(ui)
+
+    def _sign_in() -> None:
+        username = str(username_input.value or "")
+        password = str(password_input.value or "")
+        role = authenticate(username, password, credentials)
+        if role is None:
+            password_input.set_value("")
+            ui.notify("Invalid username or password.", type="negative")
+            return
+
+        app.storage.user.clear()
+        app.storage.user.update(
+            {
+                "authenticated": True,
+                "username": username,
+                "role": role,
+            }
+        )
+        ui.navigate.to("/admin" if role == "admin" else "/")
+
+    with ui.column().classes(
+        "w-full min-h-screen items-center justify-center px-4 bg-[#11111b]"
+    ):
+        with ui.card().classes(
+            "w-full max-w-sm !bg-[#1e1e2e] border border-gray-700 rounded-lg p-6"
+        ):
+            with ui.row().classes("items-center gap-3 mb-3"):
+                ui.icon("view_in_ar").classes("text-white text-3xl")
+                ui.label("Mesh Reviewer").classes("text-h5 font-bold text-white")
+            username_input = (
+                ui.select(
+                    options=[ADMIN_USERNAME, *USER_IDS],
+                    label="Username",
+                )
+                .props("outlined dark")
+                .classes("w-full")
+            )
+            password_input = (
+                ui.input(
+                    label="Password",
+                    password=True,
+                    password_toggle_button=True,
+                )
+                .props("outlined dark")
+                .classes("w-full")
+            )
+            password_input.on("keydown.enter", lambda _: _sign_in())
+            ui.button("Sign in", icon="login", on_click=_sign_in).classes(
+                "w-full mt-2"
+            )
+
+
+def build_admin_page(
+    dataset_dir: Path,
+    export_dir: Path,
+    state_dir: Path,
+    files: list[Path],
+    assignments: dict[str, str],
+) -> None:
+    inject_styles(ui)
+    refs: dict = {}
+
+    async def _export_all() -> None:
+        states = {
+            user_id: load_review_state(state_dir, user_id) for user_id in USER_IDS
+        }
+        accepted: list[tuple[Path, str]] = []
+        for path in files:
+            user_id = assignments.get(path.name)
+            if user_id is None:
+                continue
+            stem = path.stem.removesuffix(".geom")
+            if states[user_id].get(stem) == STATUS_ACCEPT:
+                accepted.append((path, user_id))
+
+        if not accepted:
+            ui.notify("No accepted meshes to export.", type="warning")
+            return
+
+        export_dir.mkdir(parents=True, exist_ok=True)
+        manifest = []
+        for path, user_id in accepted:
+            shutil.copy2(path, export_dir / path.name)
+            meta = _load_meta(path)
+            dims = meta["dims"]
+            manifest.append(
+                {
+                    "file": path.name,
+                    "reviewed_by": user_id,
+                    "bbox_cm": [round(d * 100, 3) for d in dims],
+                    "n_verts": meta["n_verts"],
+                    "n_faces": meta["n_faces"],
+                    "volume_cm3": round(float(meta["volume"]) * 1e6, 4)
+                    if np.isfinite(meta["volume"])
+                    else None,
+                }
+            )
+
+        (export_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        ui.notify(
+            f"Exported {len(accepted)} meshes to {export_dir}",
+            type="positive",
+        )
+
+    def _refresh() -> None:
+        rows = progress_rows(files, assignments, state_dir)
+        accepted = sum(row["accepted"] for row in rows)
+        denied = sum(row["denied"] for row in rows)
+        reviewed = accepted + denied
+        remaining = len(files) - reviewed
+
+        refs["total"].set_text(str(len(files)))
+        refs["reviewed"].set_text(str(reviewed))
+        refs["accepted"].set_text(str(accepted))
+        refs["denied"].set_text(str(denied))
+        refs["remaining"].set_text(str(remaining))
+        refs["progress"].set_value(reviewed / len(files) if files else 0)
+        refs["table"].rows = rows
+        refs["table"].update()
+
+    with ui.header(fixed=False).classes(HEADER):
+        with ui.row().classes("items-center gap-2"):
+            ui.icon("view_in_ar").classes("text-white text-2xl")
+            ui.label("Mesh Reviewer").classes("text-h6 font-bold text-white")
+            ui.label("Admin").classes(
+                "text-xs font-medium text-gray-300 border border-gray-600 "
+                "px-2 py-1 rounded"
+            )
+        with ui.row().classes("items-center gap-2"):
+            ui.button(
+                "Export Accepted", icon="file_download", on_click=_export_all
+            ).props("flat text-color=white")
+            ui.button(icon="logout", on_click=_logout).props("flat round").tooltip(
+                "Log out"
+            )
+
+    with ui.column().classes("w-full max-w-7xl mx-auto p-6 gap-5"):
+        ui.label("Review Progress").classes("text-h5 font-bold text-white")
+        with ui.row().classes(
+            "w-full items-stretch justify-between gap-6 py-4 border-y border-gray-700"
+        ):
+            for label, key in (
+                ("Total", "total"),
+                ("Reviewed", "reviewed"),
+                ("Accepted", "accepted"),
+                ("Denied", "denied"),
+                ("Remaining", "remaining"),
+            ):
+                with ui.column().classes("gap-1 min-w-24"):
+                    ui.label(label).classes(SECTION_HEADER)
+                    refs[key] = ui.label("0").classes(
+                        "text-2xl font-semibold text-white"
+                    )
+        refs["progress"] = ui.linear_progress(value=0, show_value=False).classes(
+            "w-full"
+        )
+        columns = [
+            {"name": "user", "label": "Reviewer", "field": "user", "align": "left"},
+            {"name": "assigned", "label": "Assigned", "field": "assigned"},
+            {"name": "reviewed", "label": "Reviewed", "field": "reviewed"},
+            {"name": "accepted", "label": "Accepted", "field": "accepted"},
+            {"name": "denied", "label": "Denied", "field": "denied"},
+            {"name": "remaining", "label": "Remaining", "field": "remaining"},
+            {"name": "progress", "label": "Progress", "field": "progress"},
+        ]
+        refs["table"] = (
+            ui.table(rows=[], columns=columns, row_key="user", pagination=20)
+            .props("flat bordered dense dark")
+            .classes("w-full")
+        )
+        ui.label(f"Dataset: {dataset_dir}").classes(
+            "text-xs text-gray-500 break-all"
+        )
+
+    _refresh()
+    ui.timer(2.0, _refresh)
+
 # Main
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -665,11 +879,60 @@ def main() -> None:
     if not dataset_dir.is_dir():
         raise SystemExit(f"Dataset directory does not exist: {dataset_dir}")
 
+    files = sorted(dataset_dir.glob("*.geom.npz"))
+    state_dir = ensure_state_dir(dataset_dir)
+    assignments = ensure_assignments(state_dir, files)
+    credentials = build_credentials()
+    storage_secret = get_storage_secret(state_dir)
+
+    @ui.page("/login")
+    def login():
+        if app.storage.user.get("authenticated"):
+            target = "/admin" if app.storage.user.get("role") == "admin" else "/"
+            return RedirectResponse(target)
+        build_login_page(credentials)
+
     @ui.page("/")
     def index():
-        build_page(dataset_dir, export_dir)
+        if not app.storage.user.get("authenticated"):
+            return RedirectResponse("/login")
+        if app.storage.user.get("role") == "admin":
+            return RedirectResponse("/admin")
 
-    ui.run(port=args.port, title="Mesh Reviewer", reload=False)
+        username = app.storage.user.get("username")
+        if username not in USER_IDS:
+            app.storage.user.clear()
+            return RedirectResponse("/login")
+
+        user_files = files_for_user(files, assignments, username)
+        build_page(
+            dataset_dir,
+            export_dir,
+            state_dir,
+            username,
+            user_files,
+        )
+
+    @ui.page("/admin")
+    def admin():
+        if not app.storage.user.get("authenticated"):
+            return RedirectResponse("/login")
+        if app.storage.user.get("role") != "admin":
+            return RedirectResponse("/")
+        build_admin_page(
+            dataset_dir,
+            export_dir,
+            state_dir,
+            files,
+            assignments,
+        )
+
+    ui.run(
+        port=args.port,
+        title="Mesh Reviewer",
+        storage_secret=storage_secret,
+        reload=False,
+    )
 
 
 if __name__ == "__main__":
