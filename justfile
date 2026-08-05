@@ -4,7 +4,7 @@
 install:
     uv sync
 
-# Run the mesh reviewer
+# Run with ./input and ./reviewed_export defaults
 run *ARGS:
     uv run python mesh_reviewer.py {{ARGS}}
 

@@ -856,8 +856,8 @@ def main() -> None:
     parser.add_argument(
         "--dataset-dir",
         type=str,
-        required=True,
-        help="Directory containing .geom.npz files",
+        default="./input",
+        help="Directory containing .geom.npz files (default: ./input)",
     )
     parser.add_argument(
         "--export-dir",

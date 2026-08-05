@@ -96,7 +96,9 @@ class AuthenticationTests(unittest.TestCase):
     def test_default_credentials_use_account_names(self) -> None:
         credentials = build_credentials({})
 
-        self.assertEqual(authenticate(ADMIN_USERNAME, "admin", credentials), "admin")
+        self.assertEqual(
+            authenticate(ADMIN_USERNAME, "qiuzhi2026", credentials), "admin"
+        )
         self.assertEqual(authenticate("user01", "user01", credentials), "reviewer")
         self.assertIsNone(authenticate("user01", "wrong", credentials))
 

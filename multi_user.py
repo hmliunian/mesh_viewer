@@ -34,7 +34,7 @@ def build_credentials(environ: Mapping[str, str] | None = None) -> dict[str, str
         for user_id in USER_IDS
     }
     credentials[ADMIN_USERNAME] = env.get(
-        "MESH_REVIEWER_ADMIN_PASSWORD", ADMIN_USERNAME
+        "MESH_REVIEWER_ADMIN_PASSWORD", "qiuzhi2026"
     )
     return credentials
 

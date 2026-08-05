@@ -32,20 +32,20 @@ uv sync
 ## Usage
 
 ```bash
-just run --dataset-dir ./input --export-dir /tmp/reviewed_export
+just run
 ```
 
 Or directly:
 
 ```bash
-uv run python mesh_reviewer.py --dataset-dir ./input
+uv run python mesh_reviewer.py
 ```
 
 ### CLI Options
 
 | Flag             | Default              | Description                              |
 |------------------|----------------------|------------------------------------------|
-| `--dataset-dir`  | *(required)*         | Directory containing `.geom.npz` files   |
+| `--dataset-dir`  | `./input`            | Directory containing `.geom.npz` files   |
 | `--export-dir`   | `./reviewed_export`  | Directory to export accepted meshes      |
 | `--port`         | `8090`               | Port for the web server                  |
 
@@ -82,8 +82,9 @@ The application has one admin and 20 fixed reviewers:
 - `admin`
 - `user01` through `user20`
 
-By default, each password is the same as its username. Configure passwords before
-exposing the server outside a trusted network:
+The default admin password is `qiuzhi2026`. Reviewer passwords are the same as
+their usernames. Configure passwords before exposing the server outside a trusted
+network:
 
 ```bash
 export MESH_REVIEWER_ADMIN_PASSWORD='replace-admin-password'
