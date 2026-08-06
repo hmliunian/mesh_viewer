@@ -8,8 +8,8 @@ A web-based GUI for reviewing `.geom.npz` mesh files. Built with [NiceGUI](https
 - Accept / Deny workflow with review state persistence
 - Keyboard shortcuts: `A` accept, `D` deny, arrow keys to navigate
 - Export accepted meshes with metadata manifest
-- Fixed reviewer accounts with stable, even task assignment
-- Admin dashboard with live per-reviewer progress
+- Configurable reviewer count and per-user pending-work quantities
+- Admin dashboard with cumulative and current-batch progress
 
 ## Prerequisites
 
@@ -77,7 +77,7 @@ Each output is named `<mesh-name>.geom.npz` and contains:
 
 ## Accounts
 
-The application has one admin and 20 fixed reviewers:
+The application has one admin and 20 available reviewer accounts:
 
 - `admin`
 - `user01` through `user20`
@@ -97,15 +97,29 @@ An individual reviewer password can override the shared password:
 export MESH_REVIEWER_USER01_PASSWORD='user01-password'
 ```
 
-Assignments are created on first startup and stored under
-`<dataset-dir>/.mesh_reviewer/assignments.json`. Existing assignments stay stable;
-new files are assigned to the reviewer with the fewest active files. Review state
-is stored separately for each user in `<dataset-dir>/.mesh_reviewer/reviews/`.
+Initial assignments are created evenly on first startup and stored under
+`<dataset-dir>/.mesh_reviewer/assignments.json`. On the admin page, the Assignment
+panel can:
+
+- select between 1 and 20 active users (`user01` through `userNN`);
+- edit the number of unreviewed files assigned to each active user;
+- restore the default even split with **Equal Split**; and
+- consolidate completed work and create a fresh batch with
+  **Refresh & Redistribute**.
+
+Custom quantities may leave files in the unassigned pool, and those files remain
+there until the next redistribution. Reviewer pages automatically reload when a
+new assignment batch is published.
+
+Current per-user state is stored in `<dataset-dir>/.mesh_reviewer/reviews/`.
+Consolidated, deduplicated results are stored in
+`<dataset-dir>/.mesh_reviewer/reviewed.json` and are never assigned again.
 
 After login, reviewers see only their assigned files while retaining the existing
 Accept, Deny, filtering, navigation, and export workflow. The admin account is
-redirected to `/admin`, which displays aggregate and per-reviewer progress and can
-export all accepted meshes.
+redirected to `/admin`, which displays cumulative and current-batch progress and
+exports accepted meshes from both consolidated and in-progress results.
+
 ## Keyboard Shortcuts
 
 

@@ -7,13 +7,19 @@ from pathlib import Path
 
 from multi_user import (
     ADMIN_USERNAME,
+    StaleAssignmentError,
     USER_IDS,
     authenticate,
+    balanced_quotas,
     build_credentials,
+    effective_review_results,
     ensure_assignments,
     files_for_user,
+    load_assignment_snapshot,
+    load_global_reviews,
     load_review_state,
     progress_rows,
+    redistribute_pending,
     set_review_status,
 )
 
@@ -89,6 +95,158 @@ class ReviewStateTests(unittest.TestCase):
             self.assertEqual(
                 load_review_state(state_dir, "user01"),
                 {"a": "accepted", "b": "denied"},
+            )
+
+
+class RedistributionTests(unittest.TestCase):
+    def test_balanced_quotas_differ_by_at_most_one(self) -> None:
+        users = USER_IDS[:3]
+
+        self.assertEqual(
+            balanced_quotas(8, users),
+            {
+                "user01": 3,
+                "user02": 3,
+                "user03": 2,
+            },
+        )
+
+    def test_refresh_consolidates_reviews_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            users = USER_IDS[:2]
+            files = [Path(f"{index}.geom.npz") for index in range(5)]
+            assignments = ensure_assignments(state_dir, files, users)
+            reviewed_file = files[0]
+            reviewer = assignments[reviewed_file.name]
+            file_key = reviewed_file.stem.removesuffix(".geom")
+            set_review_status(state_dir, reviewer, file_key, "accepted")
+
+            self.assertEqual(load_global_reviews(state_dir), {})
+            self.assertEqual(
+                effective_review_results(files, assignments, state_dir)[
+                    reviewed_file.name
+                ]["status"],
+                "accepted",
+            )
+            old_generation = load_assignment_snapshot(state_dir).generation
+
+            first = redistribute_pending(state_dir, files, users)
+
+            self.assertEqual(first["newly_reviewed"], 1)
+            self.assertEqual(first["accepted"], 1)
+            self.assertEqual(first["remaining"], 4)
+            self.assertEqual(first["assigned"], 4)
+            self.assertEqual(first["unassigned"], 0)
+            snapshot = load_assignment_snapshot(state_dir)
+            self.assertEqual(snapshot.generation, old_generation + 1)
+            self.assertEqual(snapshot.users, users)
+            self.assertNotIn(reviewed_file.name, snapshot.assignments)
+            self.assertEqual(
+                [
+                    sum(owner == user_id for owner in snapshot.assignments.values())
+                    for user_id in users
+                ],
+                [2, 2],
+            )
+            self.assertEqual(
+                load_global_reviews(state_dir)[reviewed_file.name],
+                {"status": "accepted", "reviewed_by": reviewer},
+            )
+
+            second = redistribute_pending(state_dir, files, users)
+
+            self.assertEqual(second["newly_reviewed"], 0)
+            self.assertEqual(second["accepted"], 1)
+            self.assertEqual(len(load_global_reviews(state_dir)), 1)
+
+    def test_custom_quantities_leave_a_persistent_unassigned_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            users = USER_IDS[:2]
+            files = [Path(f"{index}.geom.npz") for index in range(7)]
+            ensure_assignments(state_dir, files, users)
+
+            result = redistribute_pending(
+                state_dir,
+                files,
+                users,
+                {"user01": 2, "user02": 1},
+            )
+
+            self.assertEqual(result["assigned"], 3)
+            self.assertEqual(result["unassigned"], 4)
+            self.assertEqual(result["quotas"], {"user01": 2, "user02": 1})
+            snapshot = load_assignment_snapshot(state_dir)
+            self.assertEqual(snapshot.users, users)
+            self.assertTrue(snapshot.batch_mode)
+            self.assertEqual(
+                [
+                    sum(owner == user_id for owner in snapshot.assignments.values())
+                    for user_id in users
+                ],
+                [2, 1],
+            )
+
+            assignments_after_restart = ensure_assignments(state_dir, files)
+
+            self.assertEqual(assignments_after_restart, snapshot.assignments)
+            self.assertEqual(
+                load_assignment_snapshot(state_dir).generation,
+                snapshot.generation,
+            )
+
+    def test_submission_from_an_old_batch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            users = USER_IDS[:2]
+            files = [Path(f"{index}.geom.npz") for index in range(4)]
+            ensure_assignments(state_dir, files, users)
+            old_snapshot = load_assignment_snapshot(state_dir)
+            file_name, reviewer = next(iter(old_snapshot.assignments.items()))
+            file_key = Path(file_name).stem.removesuffix(".geom")
+
+            redistribute_pending(state_dir, files, users)
+
+            with self.assertRaises(StaleAssignmentError):
+                set_review_status(
+                    state_dir,
+                    reviewer,
+                    file_key,
+                    "denied",
+                    file_name=file_name,
+                    expected_generation=old_snapshot.generation,
+                )
+
+    def test_legacy_assignment_state_is_consolidated_on_first_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            files = [Path("legacy.geom.npz"), Path("pending.geom.npz")]
+            (state_dir / "assignments.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "users": list(USER_IDS),
+                        "assignments": {
+                            "legacy.geom.npz": "user01",
+                            "pending.geom.npz": "user02",
+                        },
+                    }
+                )
+            )
+            set_review_status(state_dir, "user01", "legacy", "denied")
+
+            result = redistribute_pending(state_dir, files, USER_IDS[:2])
+
+            self.assertEqual(result["newly_reviewed"], 1)
+            self.assertEqual(result["denied"], 1)
+            self.assertEqual(
+                load_global_reviews(state_dir)["legacy.geom.npz"],
+                {"status": "denied", "reviewed_by": "user01"},
+            )
+            self.assertNotIn(
+                "legacy.geom.npz",
+                load_assignment_snapshot(state_dir).assignments,
             )
 
 

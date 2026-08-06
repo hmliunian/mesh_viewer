@@ -33,15 +33,20 @@ from consts import (
 )
 from multi_user import (
     ADMIN_USERNAME,
+    StaleAssignmentError,
     USER_IDS,
     authenticate,
+    balanced_quotas,
     build_credentials,
+    effective_review_results,
     ensure_assignments,
     ensure_state_dir,
     files_for_user,
     get_storage_secret,
+    load_assignment_snapshot,
     load_review_state,
     progress_rows,
+    redistribute_pending,
     set_review_status,
 )
 
@@ -171,8 +176,20 @@ def build_page(
     state_dir: Path,
     username: str,
     files: list[Path],
+    assignment_generation: int,
 ) -> None:
     inject_styles(ui)
+
+    def _reload_if_reassigned() -> None:
+        if load_assignment_snapshot(state_dir).generation == assignment_generation:
+            return
+        ui.notify(
+            "Assignments changed. Loading your new batch.",
+            type="info",
+        )
+        ui.navigate.to("/")
+
+    ui.timer(2.0, _reload_if_reassigned)
 
     if not files:
         with ui.header(fixed=False).classes(HEADER):
@@ -365,8 +382,24 @@ def build_page(
 
     def _set_status(status: str) -> None:
         idx = current_idx["value"]
-        stem = _stem(files[idx])
-        latest_state = set_review_status(state_dir, username, stem, status)
+        path = files[idx]
+        stem = _stem(path)
+        try:
+            latest_state = set_review_status(
+                state_dir,
+                username,
+                stem,
+                status,
+                file_name=path.name,
+                expected_generation=assignment_generation,
+            )
+        except StaleAssignmentError:
+            ui.notify(
+                "Assignments changed. This review was not saved.",
+                type="warning",
+            )
+            ui.navigate.to("/")
+            return
         state.clear()
         state.update(latest_state)
         _update_status_icons()
@@ -726,23 +759,127 @@ def build_admin_page(
     export_dir: Path,
     state_dir: Path,
     files: list[Path],
-    assignments: dict[str, str],
 ) -> None:
     inject_styles(ui)
     refs: dict = {}
+    config = {"custom_quantities": False}
+    initial_snapshot = load_assignment_snapshot(state_dir)
+
+    def _overview() -> tuple:
+        snapshot = load_assignment_snapshot(state_dir)
+        results = effective_review_results(files, snapshot.assignments, state_dir)
+        return snapshot, results, len(files) - len(results)
+
+    def _selected_users() -> tuple[str, ...]:
+        raw_count = refs["user_count"].value
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            count = 1
+        count = max(1, min(count, len(USER_IDS)))
+        return USER_IDS[:count]
+
+    def _quantity_changed(_) -> None:
+        config["custom_quantities"] = True
+        _update_allocation_summary()
+
+    def _read_quantities(users: tuple[str, ...]) -> dict[str, int]:
+        quantities: dict[str, int] = {}
+        for user_id in users:
+            raw_value = refs["quantity_inputs"][user_id].value
+            try:
+                numeric_value = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{user_id} quantity must be an integer") from exc
+            if not numeric_value.is_integer() or numeric_value < 0:
+                raise ValueError(f"{user_id} quantity must be a non-negative integer")
+            quantities[user_id] = int(numeric_value)
+        return quantities
+
+    def _update_allocation_summary() -> None:
+        if "allocation_summary" not in refs or "quantity_inputs" not in refs:
+            return
+        _, _, pending = _overview()
+        try:
+            planned = sum(_read_quantities(_selected_users()).values())
+            unassigned = pending - planned
+            if unassigned < 0:
+                refs["allocation_summary"].set_text(
+                    f"Planned: {planned}  |  Over capacity: {-unassigned}"
+                )
+            else:
+                refs["allocation_summary"].set_text(
+                    f"Planned: {planned}  |  Left unassigned: {unassigned}"
+                )
+        except ValueError as exc:
+            refs["allocation_summary"].set_text(str(exc))
+        refs["available_pending"].set_text(f"Available unreviewed: {pending}")
+
+    def _render_quantities() -> None:
+        users = _selected_users()
+        _, _, pending = _overview()
+        quantities = balanced_quotas(pending, users)
+        config["custom_quantities"] = False
+        refs["quantity_inputs"] = {}
+        refs["quantity_container"].clear()
+        with refs["quantity_container"]:
+            with ui.grid(columns=4).classes("w-full gap-3"):
+                for user_id in users:
+                    with ui.card().classes(
+                        "w-full !bg-[#181825] border border-gray-700 p-3 gap-2"
+                    ):
+                        ui.label(user_id).classes("text-sm font-medium text-white")
+                        refs["quantity_inputs"][user_id] = (
+                            ui.number(
+                                label="Unreviewed",
+                                value=quantities[user_id],
+                                min=0,
+                                step=1,
+                                on_change=_quantity_changed,
+                            )
+                            .props("dense outlined dark")
+                            .classes("w-full")
+                        )
+        _update_allocation_summary()
+
+    def _user_count_changed(_) -> None:
+        _render_quantities()
+
+    def _redistribute() -> None:
+        users = _selected_users()
+        try:
+            quantities = (
+                _read_quantities(users) if config["custom_quantities"] else None
+            )
+            result = redistribute_pending(
+                state_dir,
+                files,
+                users,
+                quantities,
+            )
+        except (RuntimeError, ValueError) as exc:
+            ui.notify(str(exc), type="negative")
+            _refresh()
+            return
+
+        refs["user_count"].set_value(len(users))
+        _render_quantities()
+        _refresh()
+        ui.notify(
+            f"Consolidated {result['newly_reviewed']} new reviews; "
+            f"assigned {result['assigned']} files across {len(users)} users.",
+            type="positive",
+        )
 
     async def _export_all() -> None:
-        states = {
-            user_id: load_review_state(state_dir, user_id) for user_id in USER_IDS
-        }
+        snapshot = load_assignment_snapshot(state_dir)
+        results = effective_review_results(files, snapshot.assignments, state_dir)
         accepted: list[tuple[Path, str]] = []
         for path in files:
-            user_id = assignments.get(path.name)
-            if user_id is None:
+            record = results.get(path.name)
+            if record is None or record["status"] != STATUS_ACCEPT:
                 continue
-            stem = path.stem.removesuffix(".geom")
-            if states[user_id].get(stem) == STATUS_ACCEPT:
-                accepted.append((path, user_id))
+            accepted.append((path, record.get("reviewed_by", "")))
 
         if not accepted:
             ui.notify("No accepted meshes to export.", type="warning")
@@ -774,11 +911,23 @@ def build_admin_page(
         )
 
     def _refresh() -> None:
-        rows = progress_rows(files, assignments, state_dir)
-        accepted = sum(row["accepted"] for row in rows)
-        denied = sum(row["denied"] for row in rows)
+        snapshot, results, remaining = _overview()
+        rows = progress_rows(
+            files,
+            snapshot.assignments,
+            state_dir,
+            snapshot.users,
+        )
+        accepted = sum(
+            record["status"] == STATUS_ACCEPT for record in results.values()
+        )
+        denied = sum(record["status"] == STATUS_DENY for record in results.values())
         reviewed = accepted + denied
-        remaining = len(files) - reviewed
+        pending_names = {path.name for path in files} - set(results)
+        assigned_pending = sum(
+            file_name in pending_names for file_name in snapshot.assignments
+        )
+        unassigned = remaining - assigned_pending
 
         refs["total"].set_text(str(len(files)))
         refs["reviewed"].set_text(str(reviewed))
@@ -786,8 +935,13 @@ def build_admin_page(
         refs["denied"].set_text(str(denied))
         refs["remaining"].set_text(str(remaining))
         refs["progress"].set_value(reviewed / len(files) if files else 0)
+        refs["batch_status"].set_text(
+            f"Batch {snapshot.generation}  |  Active users: {len(snapshot.users)}  |  "
+            f"Assigned pending: {assigned_pending}  |  Unassigned: {unassigned}"
+        )
         refs["table"].rows = rows
         refs["table"].update()
+        _update_allocation_summary()
 
     with ui.header(fixed=False).classes(HEADER):
         with ui.row().classes("items-center gap-2"):
@@ -825,6 +979,54 @@ def build_admin_page(
         refs["progress"] = ui.linear_progress(value=0, show_value=False).classes(
             "w-full"
         )
+
+        with ui.card().classes(
+            "w-full !bg-[#1e1e2e] border border-gray-700 rounded-xl p-5 gap-4"
+        ):
+            with ui.row().classes("w-full items-center justify-between"):
+                with ui.column().classes("gap-1"):
+                    ui.label("Assignment").classes("text-lg font-semibold text-white")
+                    ui.label(
+                        "Refresh consolidates completed reviews, then creates a new batch."
+                    ).classes("text-xs text-gray-400")
+                ui.button(
+                    "Equal Split",
+                    icon="balance",
+                    on_click=_render_quantities,
+                ).props("flat")
+
+            with ui.row().classes("w-full items-center gap-6"):
+                refs["user_count"] = (
+                    ui.number(
+                        label="Active users",
+                        value=len(initial_snapshot.users),
+                        min=1,
+                        max=len(USER_IDS),
+                        step=1,
+                        on_change=_user_count_changed,
+                    )
+                    .props("outlined dark")
+                    .classes("w-40")
+                )
+                refs["available_pending"] = ui.label(
+                    "Available unreviewed: 0"
+                ).classes("text-sm text-gray-300")
+                refs["allocation_summary"] = ui.label(
+                    "Planned: 0  |  Left unassigned: 0"
+                ).classes("text-sm text-gray-300")
+
+            refs["quantity_container"] = ui.column().classes("w-full")
+            with ui.row().classes("w-full items-center justify-between"):
+                refs["batch_status"] = ui.label("").classes(
+                    "text-xs text-gray-400"
+                )
+                ui.button(
+                    "Refresh & Redistribute",
+                    icon="refresh",
+                    on_click=_redistribute,
+                ).props("unelevated").classes("px-5")
+
+        ui.label("Current Batch").classes("text-lg font-semibold text-white")
         columns = [
             {"name": "user", "label": "Reviewer", "field": "user", "align": "left"},
             {"name": "assigned", "label": "Assigned", "field": "assigned"},
@@ -843,6 +1045,7 @@ def build_admin_page(
             "text-xs text-gray-500 break-all"
         )
 
+    _render_quantities()
     _refresh()
     ui.timer(2.0, _refresh)
 
@@ -881,7 +1084,7 @@ def main() -> None:
 
     files = sorted(dataset_dir.glob("*.geom.npz"))
     state_dir = ensure_state_dir(dataset_dir)
-    assignments = ensure_assignments(state_dir, files)
+    ensure_assignments(state_dir, files)
     credentials = build_credentials()
     storage_secret = get_storage_secret(state_dir)
 
@@ -904,13 +1107,15 @@ def main() -> None:
             app.storage.user.clear()
             return RedirectResponse("/login")
 
-        user_files = files_for_user(files, assignments, username)
+        snapshot = load_assignment_snapshot(state_dir)
+        user_files = files_for_user(files, snapshot.assignments, username)
         build_page(
             dataset_dir,
             export_dir,
             state_dir,
             username,
             user_files,
+            snapshot.generation,
         )
 
     @ui.page("/admin")
@@ -924,7 +1129,6 @@ def main() -> None:
             export_dir,
             state_dir,
             files,
-            assignments,
         )
 
     ui.run(
